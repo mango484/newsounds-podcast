@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>New Sounds Podcast Feed</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 4rem auto; line-height: 1.6; color: #222; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.95em; }
+    a { color: #1a73e8; }
+  </style>
+</head>
+<body>
+  <h1>New Sounds – Podcast Feed</h1>
+  <p>
+    This is a personal podcast feed for
+    <a href="https://www.wnyc.org/browse/shows/new-sounds">New Sounds</a>
+    from WNYC, generated automatically from the WNYC website.
+    Audio is streamed directly from WNYC's servers.
+  </p>
+  <p>
+    <strong>To subscribe in your podcast app,</strong> copy the feed URL below
+    and add it as a custom RSS feed:
+  </p>
+  <p>
+    <code id="feedUrl"></code>
+  </p>
+  <script>
+    // Build the feed URL from wherever this page is hosted
+    const base = window.location.href.replace(/\/?$/, "");
+    document.getElementById("feedUrl").textContent = base + "/feed.xml";
+  </script>
+  <p>
+    <a href="feed.xml">View raw feed XML</a>
+  </p>
+</body>
+</html>
