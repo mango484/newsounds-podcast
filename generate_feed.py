@@ -3,14 +3,14 @@
 New Sounds podcast feed generator.
 
 Strategy:
-  1. Fetch the WNYC New Sounds listing page HTML
-  2. Extract episode numbers from heading text (e.g. "#5144, Mixed Messages")
-  3. For each episode number, query the WNYC story API for metadata + audio URL
-  4. Write a valid podcast RSS feed to feed.xml
+  1. Fetch the WNYC Atom feed at wnyc.org/atomfeeds/shows/newsounds
+     Each entry contains a per-episode Simplecast RSS URL in its <link>.
+  2. For each entry, fetch that individual Simplecast episode RSS feed
+     to get the audio enclosure URL and full metadata.
+  3. Assemble everything into a single podcast RSS feed.
 
-Episode numbers are cached in episode_cache.json so the API is only hit
-once per episode. The cache also stores the full episode metadata, so
-re-runs are fast even for large backlogs.
+The Atom feed returns ~20 episodes. Results are cached so each episode
+Simplecast feed is only fetched once. Re-runs are fast.
 """
 
 import json
@@ -21,14 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-LISTING_URL = "https://www.wnyc.org/browse/shows/new-sounds"
-API_BASE    = "https://api.wnyc.org/api/v1/story"
-FEED_FILE   = "feed.xml"
-CACHE_FILE  = "episode_cache.json"
+ATOM_FEED_URL = "https://www.wnyc.org/atomfeeds/shows/newsounds"
+FEED_FILE     = "feed.xml"
+CACHE_FILE    = "episode_cache.json"
 
 FEED_TITLE       = "New Sounds (WNYC)"
 FEED_DESCRIPTION = ("New York Public Radio's home for the musically curious "
@@ -38,8 +36,8 @@ FEED_IMAGE       = "https://media.wnyc.org/i/1860/1860/c/80/2024/12/new_sounds_l
 FEED_AUTHOR      = "WNYC / New York Public Radio"
 FEED_EMAIL       = "hello@newsounds.org"
 
-REQUEST_DELAY    = 1.5   # seconds between API calls — be polite to WNYC
-HEADERS          = {
+REQUEST_DELAY = 1.0
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -47,7 +45,7 @@ HEADERS          = {
     )
 }
 
-# ── Cache helpers ─────────────────────────────────────────────────────────────
+# ── Cache ─────────────────────────────────────────────────────────────────────
 
 def load_cache():
     if Path(CACHE_FILE).exists():
@@ -55,163 +53,171 @@ def load_cache():
             return json.load(f)
     return {}
 
-
 def save_cache(cache):
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
 
+# ── Step 1: parse WNYC Atom feed ──────────────────────────────────────────────
 
-# ── Step 1: get episode numbers from listing page ────────────────────────────
-
-def get_episode_numbers():
+def get_atom_entries():
     """
-    Fetch the WNYC listing page and extract episode numbers from
-    heading text like "#5144, Mixed Messages" or "# 4893, Music for..."
-    Returns a list of int episode numbers, most recent first.
+    Fetch the WNYC Atom feed and return a list of dicts with:
+      - title
+      - simplecast_feed_url  (the per-episode Simplecast RSS URL)
+      - pub_date
+      - description
     """
-    print(f"Fetching episode listing from {LISTING_URL} ...")
-    resp = requests.get(LISTING_URL, headers=HEADERS, timeout=20)
+    print(f"Fetching WNYC Atom feed...")
+    resp = requests.get(ATOM_FEED_URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # Parse Atom XML — register namespaces to avoid 'ns0:' prefixes
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "media": "http://search.yahoo.com/mrss/",
+    }
 
-    numbers = []
-    seen = set()
+    root = ET.fromstring(resp.content)
 
-    # Look for headings that contain the episode number pattern
-    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "li", "span", "p", "div"]):
-        text = tag.get_text(" ", strip=True)
-        # Matches "#5144", "# 4893", "#4721" etc.
-        m = re.search(r"#\s*(\d{4,5})", text)
-        if m:
-            n = int(m.group(1))
-            if n not in seen:
-                seen.add(n)
-                numbers.append(n)
+    entries = []
+    for entry in root.findall("atom:entry", ns):
+        title_el = entry.find("atom:title", ns)
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
 
-    print(f"  Found {len(numbers)} episode numbers: {numbers[:5]}{'...' if len(numbers) > 5 else ''}")
-    return numbers
+        # The per-episode Simplecast feed URL is in a <link> element.
+        # There may be several <link> elements; find the one pointing to simplecast.
+        sc_url = None
+        for link_el in entry.findall("atom:link", ns):
+            href = link_el.get("href", "")
+            if "simplecast.com" in href:
+                sc_url = href
+                break
 
+        if not sc_url:
+            # Also check plain text content for a simplecast URL
+            content_el = entry.find("atom:content", ns)
+            if content_el is not None and content_el.text:
+                m = re.search(r'https://feeds\.simplecast\.com/[\w-]+', content_el.text)
+                if m:
+                    sc_url = m.group(0)
 
-# ── Step 2: fetch episode metadata from WNYC API ─────────────────────────────
+        if not sc_url:
+            print(f"  Skipping '{title}' — no Simplecast URL found in entry")
+            continue
 
-def _deep_get(d, *keys):
-    """Safely traverse nested dicts."""
-    for k in keys:
-        if not isinstance(d, dict):
-            return None
-        d = d.get(k)
-    return d
+        # Publication date
+        pub_el = entry.find("atom:published", ns) or entry.find("atom:updated", ns)
+        pub_date_raw = pub_el.text.strip() if pub_el is not None and pub_el.text else ""
 
+        # Summary / description
+        summary_el = entry.find("atom:summary", ns) or entry.find("atom:content", ns)
+        description = ""
+        if summary_el is not None and summary_el.text:
+            # Strip any HTML tags from description
+            description = re.sub(r"<[^>]+>", "", summary_el.text).strip()
 
-def fetch_episode(number, cache):
+        entries.append({
+            "title":               title,
+            "simplecast_feed_url": sc_url,
+            "pub_date_raw":        pub_date_raw,
+            "description":         description,
+        })
+
+    print(f"  Found {len(entries)} entries in Atom feed")
+    return entries
+
+# ── Step 2: fetch audio URL from per-episode Simplecast feed ─────────────────
+
+def fetch_audio_from_simplecast_feed(sc_url, cache):
     """
-    Fetch metadata + audio URL for a single episode from the WNYC API.
-    Returns a dict or None if no audio is available.
-    Results are cached so each episode is only fetched once.
+    Each entry's Simplecast URL is an RSS feed for that single episode.
+    Parse it to extract the audio enclosure URL, duration, and image.
+    Returns a dict or None on failure.
     """
-    key = str(number)
-    if key in cache:
-        return cache[key]
-
-    # The WNYC story API slug for New Sounds episodes follows this pattern
-    slug = f"new-sounds-{number}"
-    url  = f"{API_BASE}/{slug}/"
+    if sc_url in cache:
+        return cache[sc_url]
 
     time.sleep(REQUEST_DELAY)
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        resp = requests.get(sc_url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
     except requests.RequestException as e:
-        print(f"  Network error for episode {number}: {e}")
-        return None
-
-    if resp.status_code == 404:
-        print(f"  Episode {number}: not found in API (404), skipping")
-        return None
-    if not resp.ok:
-        print(f"  Episode {number}: API returned {resp.status_code}, skipping")
+        print(f"    Network error fetching {sc_url}: {e}")
         return None
 
     try:
-        data = resp.json()
-    except Exception:
-        print(f"  Episode {number}: could not parse API response as JSON")
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        print(f"    XML parse error for {sc_url}: {e}")
         return None
 
-    # Audio URL may live in several places depending on API version
-    audio_url = (
-        data.get("audio")
-        or data.get("audio_url")
-        or _deep_get(data, "audio_info", "url")
-        or _deep_get(data, "attributes", "audio")
-        or _deep_get(data, "attributes", "audio_url")
-        or _deep_get(data, "attributes", "audio_info", "url")
-    )
+    channel = root.find("channel")
+    if channel is None:
+        return None
+
+    item = channel.find("item")
+    if item is None:
+        return None
+
+    # Audio URL from enclosure tag
+    enclosure = item.find("enclosure")
+    audio_url = enclosure.get("url") if enclosure is not None else None
 
     if not audio_url:
-        print(f"  Episode {number}: no audio URL found, skipping")
         return None
 
-    # Normalise publication date to RFC 2822 for RSS
-    raw_date = (
-        data.get("publish_at")
-        or data.get("date_published")
-        or data.get("newsdate")
-        or ""
-    )
-    try:
-        dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-        pub_date = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
-    except Exception:
-        pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    # Duration from itunes:duration
+    ns_itunes = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+    dur_el = item.find(f"{{{ns_itunes}}}duration")
+    duration_str = dur_el.text.strip() if dur_el is not None and dur_el.text else "00:00:00"
 
-    # Image: prefer episode art, fall back to show image
-    image = (
-        _deep_get(data, "image", "url")
-        or data.get("image")
-        or data.get("thumbnail")
-        or FEED_IMAGE
-    )
-    if isinstance(image, str) and image.startswith("/"):
-        image = "https://media.wnyc.org" + image
+    # Episode image (prefer item-level, fall back to channel-level)
+    img_el = item.find(f"{{{ns_itunes}}}image")
+    if img_el is None:
+        img_el = channel.find(f"{{{ns_itunes}}}image")
+    image = img_el.get("href") if img_el is not None else FEED_IMAGE
 
-    episode = {
-        "number":           number,
-        "title":            data.get("title") or f"New Sounds #{number}",
-        "description":      data.get("body") or data.get("tease") or "",
-        "url":              (data.get("url")
-                             or f"https://www.wnycstudios.org/podcasts/newsounds/episodes/{slug}"),
-        "audio_url":        audio_url,
-        "pub_date":         pub_date,
-        "image":            image if isinstance(image, str) else FEED_IMAGE,
-        "duration_seconds": data.get("audio_duration_seconds") or 0,
+    # pub date from item
+    pub_el = item.find("pubDate")
+    pub_date = pub_el.text.strip() if pub_el is not None and pub_el.text else ""
+
+    # Full description from item
+    desc_el = item.find("description") or item.find(f"{{{ns_itunes}}}summary")
+    description = ""
+    if desc_el is not None and desc_el.text:
+        description = re.sub(r"<[^>]+>", "", desc_el.text).strip()
+
+    # Title from item
+    title_el = item.find("title")
+    title = title_el.text.strip() if title_el is not None and title_el.text else ""
+
+    # Episode page link
+    link_el = item.find("link")
+    link = link_el.text.strip() if link_el is not None and link_el.text else sc_url
+
+    result = {
+        "audio_url":   audio_url,
+        "duration":    duration_str,
+        "image":       image or FEED_IMAGE,
+        "pub_date":    pub_date,
+        "description": description,
+        "title":       title,
+        "link":        link,
     }
 
-    cache[key] = episode
-    print(f"  Fetched episode {number}: {episode['title'][:60]}")
-    return episode
-
+    cache[sc_url] = result
+    return result
 
 # ── Step 3: build RSS ─────────────────────────────────────────────────────────
-
-def format_duration(seconds):
-    try:
-        s = int(seconds)
-        h, rem = divmod(s, 3600)
-        m, sec = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{sec:02d}"
-    except Exception:
-        return "00:00:00"
-
 
 def build_rss(episodes):
     ET.register_namespace("itunes", "http://www.itunes.com/dtds/podcast-1.0.dtd")
     ET.register_namespace("atom",   "http://www.w3.org/2005/Atom")
 
     rss = ET.Element("rss", {
-        "version":        "2.0",
-        "xmlns:itunes":   "http://www.itunes.com/dtds/podcast-1.0.dtd",
-        "xmlns:atom":     "http://www.w3.org/2005/Atom",
+        "version":      "2.0",
+        "xmlns:itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
+        "xmlns:atom":   "http://www.w3.org/2005/Atom",
     })
     channel = ET.SubElement(rss, "channel")
 
@@ -246,56 +252,67 @@ def build_rss(episodes):
 
     for ep in episodes:
         item = sub(channel, "item")
-        sub(item, "title",              ep["title"])
-        sub(item, "link",               ep["url"])
-        sub(item, "guid",               ep["url"], isPermaLink="true")
-        sub(item, "pubDate",            ep["pub_date"])
-        sub(item, "description",        ep["description"])
-        sub(item, "itunes:summary",     ep["description"])
-        sub(item, "itunes:author",      FEED_AUTHOR)
-        sub(item, "itunes:duration",    format_duration(ep["duration_seconds"]))
+        sub(item, "title",           ep["title"])
+        sub(item, "link",            ep["link"])
+        sub(item, "guid",            ep["link"], isPermaLink="true")
+        sub(item, "pubDate",         ep["pub_date"])
+        sub(item, "description",     ep["description"])
+        sub(item, "itunes:summary",  ep["description"])
+        sub(item, "itunes:author",   FEED_AUTHOR)
+        sub(item, "itunes:duration", ep["duration"])
         sub(item, "enclosure",
             url    = ep["audio_url"],
             length = "0",
             type   = "audio/mpeg")
-        ep_img = ep.get("image") or FEED_IMAGE
-        if ep_img != FEED_IMAGE:
-            sub(item, "itunes:image", href=ep_img)
+        if ep.get("image") and ep["image"] != FEED_IMAGE:
+            sub(item, "itunes:image", href=ep["image"])
 
     ET.indent(rss, space="  ")
     return ET.tostring(rss, encoding="unicode", xml_declaration=True)
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     cache   = load_cache()
-    numbers = get_episode_numbers()
+    entries = get_atom_entries()
 
-    if not numbers:
-        print("No episode numbers found — the page structure may have changed.")
-        print("The feed.xml will not be updated.")
+    if not entries:
+        print("No entries found in Atom feed — feed not updated.")
         return
 
     episodes  = []
     new_count = 0
 
-    for number in numbers:
-        was_cached = str(number) in cache
-        ep = fetch_episode(number, cache)
-        if ep:
-            episodes.append(ep)
-            if not was_cached:
-                new_count += 1
+    for entry in entries:
+        sc_url    = entry["simplecast_feed_url"]
+        was_cached = sc_url in cache
+
+        print(f"  Processing: {entry['title'][:60]}")
+        ep_data = fetch_audio_from_simplecast_feed(sc_url, cache)
+
+        if not ep_data:
+            print(f"    → no audio found, skipping")
+            continue
+
+        # Merge: prefer richer data from Simplecast RSS, fall back to Atom entry
+        episode = {
+            "title":       ep_data["title"] or entry["title"],
+            "link":        ep_data["link"],
+            "pub_date":    ep_data["pub_date"] or entry.get("pub_date_raw", ""),
+            "description": ep_data["description"] or entry.get("description", ""),
+            "audio_url":   ep_data["audio_url"],
+            "duration":    ep_data["duration"],
+            "image":       ep_data["image"],
+        }
+        episodes.append(episode)
+        if not was_cached:
+            new_count += 1
 
     save_cache(cache)
 
     if not episodes:
         print("No episodes with audio found — feed not written.")
         return
-
-    # Sort newest first by episode number (higher = newer)
-    episodes.sort(key=lambda e: e["number"], reverse=True)
 
     print(f"\nBuilding RSS feed: {len(episodes)} episodes ({new_count} newly fetched)...")
     xml_str = build_rss(episodes)
@@ -304,7 +321,6 @@ def main():
         f.write(xml_str)
 
     print(f"✓ Feed written to {FEED_FILE}")
-
 
 if __name__ == "__main__":
     main()
