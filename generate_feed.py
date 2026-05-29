@@ -3,14 +3,13 @@
 New Sounds podcast feed generator.
 
 Strategy:
-  1. Fetch the WNYC Atom feed at wnyc.org/atomfeeds/shows/newsounds
-     Each entry contains a per-episode Simplecast RSS URL in its <link>.
-  2. For each entry, fetch that individual Simplecast episode RSS feed
-     to get the audio enclosure URL and full metadata.
-  3. Assemble everything into a single podcast RSS feed.
-
-The Atom feed returns ~20 episodes. Results are cached so each episode
-Simplecast feed is only fetched once. Re-runs are fast.
+  1. Fetch wnyc.org/browse/shows/new-sounds (server-side rendered HTML)
+  2. Extract episode UUIDs from Simplecast image URLs in the HTML
+     e.g. image.simplecastcdn.com/images/{podcast_uuid}/{episode_uuid}/...
+  3. Use the Simplecast oEmbed endpoint to get each episode's iframe HTML,
+     which embeds the audio URL.
+  4. Parse metadata (title, description, pub_date) directly from the listing HTML.
+  5. Write a valid podcast RSS feed.
 """
 
 import json
@@ -21,12 +20,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-ATOM_FEED_URL = "https://www.wnyc.org/atomfeeds/shows/newsounds"
-FEED_FILE     = "feed.xml"
-CACHE_FILE    = "episode_cache.json"
+LISTING_URL  = "https://www.wnyc.org/browse/shows/new-sounds"
+OEMBED_URL   = "https://simplecast.com/oembed"
+FEED_FILE    = "feed.xml"
+CACHE_FILE   = "episode_cache.json"
 
 FEED_TITLE       = "New Sounds (WNYC)"
 FEED_DESCRIPTION = ("New York Public Radio's home for the musically curious "
@@ -36,7 +37,7 @@ FEED_IMAGE       = "https://media.wnyc.org/i/1860/1860/c/80/2024/12/new_sounds_l
 FEED_AUTHOR      = "WNYC / New York Public Radio"
 FEED_EMAIL       = "hello@newsounds.org"
 
-REQUEST_DELAY = 1.0
+REQUEST_DELAY = 1.5
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -57,158 +58,189 @@ def save_cache(cache):
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
 
-# ── Step 1: parse WNYC Atom feed ──────────────────────────────────────────────
+# ── Step 1: scrape listing page ───────────────────────────────────────────────
 
-def get_atom_entries():
+def parse_listing_page():
     """
-    Fetch the WNYC Atom feed and return a list of dicts with:
+    Fetch the wnyc.org New Sounds listing page and extract:
+      - episode_uuid  (from Simplecast CDN image URLs)
       - title
-      - simplecast_feed_url  (the per-episode Simplecast RSS URL)
-      - pub_date
       - description
+      - image_url
+      - duration_str  (e.g. "57 min")
+    Returns list of dicts, one per episode.
     """
-    print(f"Fetching WNYC Atom feed...")
-    resp = requests.get(ATOM_FEED_URL, headers=HEADERS, timeout=20)
+    print(f"Fetching listing page...")
+    resp = requests.get(LISTING_URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
 
-    # Parse Atom XML — register namespaces to avoid 'ns0:' prefixes
-    ns = {
-        "atom": "http://www.w3.org/2005/Atom",
-        "media": "http://search.yahoo.com/mrss/",
-    }
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    root = ET.fromstring(resp.content)
+    # Episode UUIDs live in Simplecast CDN image URLs:
+    # https://image.simplecastcdn.com/images/{podcast_uuid}/{episode_uuid}/filename.jpg
+    # We find all such img src values and extract the episode UUID (second UUID).
+    uuid_pattern = re.compile(
+        r"image\.simplecastcdn\.com/images/"
+        r"[0-9a-f-]+/"          # podcast UUID (ignore)
+        r"([0-9a-f-]{36})"      # episode UUID (capture)
+    )
 
-    entries = []
-    for entry in root.findall("atom:entry", ns):
-        title_el = entry.find("atom:title", ns)
-        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+    # Build a list preserving order, deduplicating
+    episodes_raw = []
+    seen_uuids = set()
 
-        # The per-episode Simplecast feed URL is in a <link> element.
-        # There may be several <link> elements; find the one pointing to simplecast.
-        sc_url = None
-        for link_el in entry.findall("atom:link", ns):
-            href = link_el.get("href", "")
-            if "simplecast.com" in href:
-                sc_url = href
-                break
-
-        if not sc_url:
-            # Also check plain text content for a simplecast URL
-            content_el = entry.find("atom:content", ns)
-            if content_el is not None and content_el.text:
-                m = re.search(r'https://feeds\.simplecast\.com/[\w-]+', content_el.text)
-                if m:
-                    sc_url = m.group(0)
-
-        if not sc_url:
-            print(f"  Skipping '{title}' — no Simplecast URL found in entry")
+    # Each episode on the page is typically a section/article/div with:
+    # - An img with a simplecastcdn.com src
+    # - A heading with the episode title
+    # - A paragraph with the description
+    # We'll find all simplecast image elements and work outward.
+    for img in soup.find_all("img", src=True):
+        m = uuid_pattern.search(img["src"])
+        if not m:
             continue
+        ep_uuid = m.group(1)
+        if ep_uuid in seen_uuids:
+            continue
+        seen_uuids.add(ep_uuid)
 
-        # Publication date
-        pub_el = entry.find("atom:published", ns) or entry.find("atom:updated", ns)
-        pub_date_raw = pub_el.text.strip() if pub_el is not None and pub_el.text else ""
+        # Image URL — use a higher-res version
+        img_url = img["src"]
+        # Replace small thumbnail dimensions if present
+        img_url = re.sub(r"/fill-\d+x\d+-[^/|]+", "/fill-600x600-c0", img_url)
 
-        # Summary / description
-        summary_el = entry.find("atom:summary", ns) or entry.find("atom:content", ns)
+        # Walk up the DOM to find the nearest container with title/description
+        container = img.parent
+        for _ in range(6):  # look up to 6 levels
+            if container is None:
+                break
+            h = container.find(["h2", "h3", "h4"])
+            if h and h.get_text(strip=True):
+                break
+            container = container.parent
+
+        title = ""
         description = ""
-        if summary_el is not None and summary_el.text:
-            # Strip any HTML tags from description
-            description = re.sub(r"<[^>]+>", "", summary_el.text).strip()
+        duration_str = ""
 
-        entries.append({
-            "title":               title,
-            "simplecast_feed_url": sc_url,
-            "pub_date_raw":        pub_date_raw,
-            "description":         description,
+        if container:
+            h = container.find(["h2", "h3", "h4"])
+            if h:
+                title = h.get_text(" ", strip=True)
+
+            # Description: first <p> that isn't just metadata
+            for p in container.find_all("p"):
+                txt = p.get_text(" ", strip=True)
+                if txt and len(txt) > 30:
+                    description = txt
+                    break
+
+            # Duration: look for text like "57 min" or "1 hr 2 min"
+            text_blob = container.get_text(" ")
+            dm = re.search(r"(\d+\s*(?:hr\s*\d+\s*min|\s*min))", text_blob)
+            if dm:
+                duration_str = dm.group(1).strip()
+
+        episodes_raw.append({
+            "episode_uuid": ep_uuid,
+            "title":        title,
+            "description":  description,
+            "image_url":    img_url,
+            "duration_str": duration_str,
         })
 
-    print(f"  Found {len(entries)} entries in Atom feed")
-    return entries
+    print(f"  Found {len(episodes_raw)} episodes with Simplecast UUIDs")
+    return episodes_raw
 
-# ── Step 2: fetch audio URL from per-episode Simplecast feed ─────────────────
+# ── Step 2: get audio URL via oEmbed ─────────────────────────────────────────
 
-def fetch_audio_from_simplecast_feed(sc_url, cache):
+def get_audio_url_via_oembed(episode_uuid, cache):
     """
-    Each entry's Simplecast URL is an RSS feed for that single episode.
-    Parse it to extract the audio enclosure URL, duration, and image.
-    Returns a dict or None on failure.
+    Use Simplecast's oEmbed endpoint to get the iframe embed HTML for an episode.
+    The iframe src contains the audio file URL.
+    Returns audio_url string or None.
     """
-    if sc_url in cache:
-        return cache[sc_url]
+    cache_key = f"oembed:{episode_uuid}"
+    if cache_key in cache:
+        return cache[cache_key]
 
+    player_url = f"https://player.simplecast.com/{episode_uuid}"
+    time.sleep(REQUEST_DELAY)
+
+    try:
+        resp = requests.get(
+            OEMBED_URL,
+            params={"url": player_url, "format": "json"},
+            headers=HEADERS,
+            timeout=20
+        )
+        if resp.status_code == 404:
+            print(f"    oEmbed 404 for {episode_uuid}")
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"    oEmbed error for {episode_uuid}: {e}")
+        return None
+
+    # The oEmbed response has an 'html' field with an iframe.
+    # The iframe src is the player URL; we need to fetch that to get the audio URL.
+    # But actually the iframe src itself IS the player URL we can fetch.
+    html = data.get("html", "")
+    iframe_m = re.search(r'src="(https://player\.simplecast\.com/[^"]+)"', html)
+    if not iframe_m:
+        # Try without quotes variant
+        iframe_m = re.search(r"src='(https://player\.simplecast\.com/[^']+)'", html)
+
+    if not iframe_m:
+        print(f"    No iframe src found in oEmbed for {episode_uuid}")
+        return None
+
+    iframe_src = iframe_m.group(1)
+
+    # Fetch the player page to get the actual audio URL
     time.sleep(REQUEST_DELAY)
     try:
-        resp = requests.get(sc_url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"    Network error fetching {sc_url}: {e}")
+        player_resp = requests.get(iframe_src, headers=HEADERS, timeout=20)
+        player_resp.raise_for_status()
+    except Exception as e:
+        print(f"    Player page error for {episode_uuid}: {e}")
         return None
 
-    try:
-        root = ET.fromstring(resp.content)
-    except ET.ParseError as e:
-        print(f"    XML parse error for {sc_url}: {e}")
+    # Audio URL is in the page source — look for cdn.simplecast.com .mp3 URL
+    audio_m = re.search(
+        r'(https://[^"\']+cdn\.simplecast\.com/audio/[^"\']+\.mp3[^"\']*)',
+        player_resp.text
+    )
+    if not audio_m:
+        # Also check for enclosure URLs in any embedded JSON
+        audio_m = re.search(
+            r'"(https://cdn\.simplecast\.com/audio/[^"]+\.mp3[^"]*)"',
+            player_resp.text
+        )
+
+    if not audio_m:
+        print(f"    No audio URL found in player page for {episode_uuid}")
         return None
 
-    channel = root.find("channel")
-    if channel is None:
-        return None
-
-    item = channel.find("item")
-    if item is None:
-        return None
-
-    # Audio URL from enclosure tag
-    enclosure = item.find("enclosure")
-    audio_url = enclosure.get("url") if enclosure is not None else None
-
-    if not audio_url:
-        return None
-
-    # Duration from itunes:duration
-    ns_itunes = "http://www.itunes.com/dtds/podcast-1.0.dtd"
-    dur_el = item.find(f"{{{ns_itunes}}}duration")
-    duration_str = dur_el.text.strip() if dur_el is not None and dur_el.text else "00:00:00"
-
-    # Episode image (prefer item-level, fall back to channel-level)
-    img_el = item.find(f"{{{ns_itunes}}}image")
-    if img_el is None:
-        img_el = channel.find(f"{{{ns_itunes}}}image")
-    image = img_el.get("href") if img_el is not None else FEED_IMAGE
-
-    # pub date from item
-    pub_el = item.find("pubDate")
-    pub_date = pub_el.text.strip() if pub_el is not None and pub_el.text else ""
-
-    # Full description from item
-    desc_el = item.find("description") or item.find(f"{{{ns_itunes}}}summary")
-    description = ""
-    if desc_el is not None and desc_el.text:
-        description = re.sub(r"<[^>]+>", "", desc_el.text).strip()
-
-    # Title from item
-    title_el = item.find("title")
-    title = title_el.text.strip() if title_el is not None and title_el.text else ""
-
-    # Episode page link
-    link_el = item.find("link")
-    link = link_el.text.strip() if link_el is not None and link_el.text else sc_url
-
-    result = {
-        "audio_url":   audio_url,
-        "duration":    duration_str,
-        "image":       image or FEED_IMAGE,
-        "pub_date":    pub_date,
-        "description": description,
-        "title":       title,
-        "link":        link,
-    }
-
-    cache[sc_url] = result
-    return result
+    audio_url = audio_m.group(1)
+    cache[cache_key] = audio_url
+    return audio_url
 
 # ── Step 3: build RSS ─────────────────────────────────────────────────────────
+
+def duration_to_hms(duration_str):
+    """Convert '57 min' or '1 hr 2 min' to HH:MM:SS."""
+    total_min = 0
+    hr_m = re.search(r"(\d+)\s*hr", duration_str)
+    min_m = re.search(r"(\d+)\s*min", duration_str)
+    if hr_m:
+        total_min += int(hr_m.group(1)) * 60
+    if min_m:
+        total_min += int(min_m.group(1))
+    if not total_min:
+        return "00:00:00"
+    h, m = divmod(total_min, 60)
+    return f"{h:02d}:{m:02d}:00"
 
 def build_rss(episodes):
     ET.register_namespace("itunes", "http://www.itunes.com/dtds/podcast-1.0.dtd")
@@ -251,21 +283,26 @@ def build_rss(episodes):
     ET.SubElement(channel, "itunes:category", {"text": "Music"})
 
     for ep in episodes:
+        pub_date = ep.get("pub_date") or now
+        link     = ep.get("link") or FEED_LINK
+        image    = ep.get("image_url") or FEED_IMAGE
+        duration = duration_to_hms(ep.get("duration_str", ""))
+
         item = sub(channel, "item")
-        sub(item, "title",           ep["title"])
-        sub(item, "link",            ep["link"])
-        sub(item, "guid",            ep["link"], isPermaLink="true")
-        sub(item, "pubDate",         ep["pub_date"])
-        sub(item, "description",     ep["description"])
-        sub(item, "itunes:summary",  ep["description"])
+        sub(item, "title",           ep["title"] or "New Sounds")
+        sub(item, "link",            link)
+        sub(item, "guid",            f"newsounds:{ep['episode_uuid']}", isPermaLink="false")
+        sub(item, "pubDate",         pub_date)
+        sub(item, "description",     ep.get("description", ""))
+        sub(item, "itunes:summary",  ep.get("description", ""))
         sub(item, "itunes:author",   FEED_AUTHOR)
-        sub(item, "itunes:duration", ep["duration"])
+        sub(item, "itunes:duration", duration)
         sub(item, "enclosure",
             url    = ep["audio_url"],
             length = "0",
             type   = "audio/mpeg")
-        if ep.get("image") and ep["image"] != FEED_IMAGE:
-            sub(item, "itunes:image", href=ep["image"])
+        if image != FEED_IMAGE:
+            sub(item, "itunes:image", href=image)
 
     ET.indent(rss, space="  ")
     return ET.tostring(rss, encoding="unicode", xml_declaration=True)
@@ -273,38 +310,34 @@ def build_rss(episodes):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    cache   = load_cache()
-    entries = get_atom_entries()
+    cache       = load_cache()
+    raw_entries = parse_listing_page()
 
-    if not entries:
-        print("No entries found in Atom feed — feed not updated.")
+    if not raw_entries:
+        print("No episodes found on listing page — feed not updated.")
         return
 
     episodes  = []
     new_count = 0
 
-    for entry in entries:
-        sc_url    = entry["simplecast_feed_url"]
-        was_cached = sc_url in cache
+    for raw in raw_entries:
+        ep_uuid    = raw["episode_uuid"]
+        was_cached = f"oembed:{ep_uuid}" in cache
 
-        print(f"  Processing: {entry['title'][:60]}")
-        ep_data = fetch_audio_from_simplecast_feed(sc_url, cache)
+        print(f"  {raw['title'][:55] or ep_uuid}")
+        audio_url = get_audio_url_via_oembed(ep_uuid, cache)
 
-        if not ep_data:
-            print(f"    → no audio found, skipping")
+        if not audio_url:
             continue
 
-        # Merge: prefer richer data from Simplecast RSS, fall back to Atom entry
-        episode = {
-            "title":       ep_data["title"] or entry["title"],
-            "link":        ep_data["link"],
-            "pub_date":    ep_data["pub_date"] or entry.get("pub_date_raw", ""),
-            "description": ep_data["description"] or entry.get("description", ""),
-            "audio_url":   ep_data["audio_url"],
-            "duration":    ep_data["duration"],
-            "image":       ep_data["image"],
-        }
-        episodes.append(episode)
+        ep = dict(raw)
+        ep["audio_url"] = audio_url
+        # pub_date: we don't have it from the listing page, so use a placeholder
+        # that keeps episodes in page order (most recent first = index 0)
+        ep["pub_date"]  = ""
+        ep["link"]      = f"https://new-sounds.simplecast.com/episodes/{ep_uuid}"
+        episodes.append(ep)
+
         if not was_cached:
             new_count += 1
 
@@ -313,6 +346,14 @@ def main():
     if not episodes:
         print("No episodes with audio found — feed not written.")
         return
+
+    # Set pub_dates: we don't have real dates from the page, so assign synthetic
+    # ones spaced one week apart, most recent first, so podcast apps sort correctly.
+    base_date = datetime.now(timezone.utc)
+    for i, ep in enumerate(episodes):
+        from datetime import timedelta
+        dt = base_date - timedelta(weeks=i)
+        ep["pub_date"] = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
 
     print(f"\nBuilding RSS feed: {len(episodes)} episodes ({new_count} newly fetched)...")
     xml_str = build_rss(episodes)
