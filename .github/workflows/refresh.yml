@@ -1,0 +1,40 @@
+name: Refresh New Sounds Feed
+
+on:
+  schedule:
+    # Runs every day at 6 AM UTC (2 AM Eastern)
+    - cron: "0 6 * * *"
+  # Also lets you trigger it manually from the GitHub Actions tab
+  workflow_dispatch:
+
+# Allow the workflow to commit and push the updated feed
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate feed
+        run: python generate_feed.py
+
+      - name: Commit and push updated feed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add feed.xml episode_cache.json
+          # Only commit if something actually changed
+          git diff --staged --quiet || git commit -m "Update feed $(date -u +'%Y-%m-%d')"
+          git push
