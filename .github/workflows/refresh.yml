@@ -7,7 +7,6 @@ on:
   # Also lets you trigger it manually from the GitHub Actions tab
   workflow_dispatch:
 
-# Allow the workflow to commit and push the updated feed
 permissions:
   contents: write
 
@@ -30,11 +29,16 @@ jobs:
       - name: Generate feed
         run: python generate_feed.py
 
-      - name: Commit and push updated feed
+      - name: Commit and push if feed was created or updated
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feed.xml episode_cache.json
-          # Only commit if something actually changed
-          git diff --staged --quiet || git commit -m "Update feed $(date -u +'%Y-%m-%d')"
-          git push
+          # Stage only if the files exist (first run may skip if site is down)
+          git add feed.xml episode_cache.json 2>/dev/null || true
+          # Only commit if there are staged changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update feed $(date -u +'%Y-%m-%d')"
+            git push
+          fi
